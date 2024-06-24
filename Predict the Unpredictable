@@ -1,0 +1,128 @@
+import pandas as pd
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error
+import numpy as np
+import xgboost as xgb
+from sklearn.ensemble import StackingRegressor
+from scipy.stats import randint, uniform
+
+# Load the provided CSV files
+file_path = '/kaggle/input/predicta1/historical_weather new.csv'
+submission_sample_path = '/kaggle/input/predicta1/sample_submission.csv'
+submission_key_path = '/kaggle/input/predicta1/submission_key.csv'
+
+weather_data = pd.read_csv(file_path)
+sample_submission = pd.read_csv(submission_sample_path)
+submission_key = pd.read_csv(submission_key_path)
+
+
+# Fill null values in avg_temp_c
+def fill_avg_temp(row):
+    if pd.isnull(row['avg_temp_c']):
+        if not pd.isnull(row['min_temp_c']) and not pd.isnull(row['max_temp_c']):
+            return (row['min_temp_c'] + row['max_temp_c']) / 2
+        else:
+            return avg_temp_median
+    else:
+        return row['avg_temp_c']
+
+weather_data['avg_temp_c'] = weather_data.apply(fill_avg_temp, axis=1)
+
+# Fill null values in avg_wind_speed_kmh with the mean
+avg_wind_speed_mean = weather_data['avg_wind_speed_kmh'].mean()
+weather_data['avg_wind_speed_kmh'].fillna(avg_wind_speed_mean, inplace=True)
+
+# Remove the min_temp_c and max_temp_c columns and convert city_id to integer
+weather_data.drop(columns=['min_temp_c', 'max_temp_c'], inplace=True)
+weather_data['city_id'] = weather_data['city_id'].str.extract('(\d+)').astype(int)
+
+# Preprocessing: Extract features from the date column
+weather_data['date'] = pd.to_datetime(weather_data['date'])
+weather_data['year'] = weather_data['date'].dt.year
+weather_data['month'] = weather_data['date'].dt.month
+weather_data['day'] = weather_data['date'].dt.day
+weather_data['day_of_year'] = weather_data['date'].dt.dayofyear
+
+# Prepare the training data
+X = weather_data[['city_id', 'year', 'month', 'day', 'day_of_year', 'avg_wind_speed_kmh']]
+y = weather_data['avg_temp_c']
+
+# Split the data into training and testing sets
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Hyperparameter tuning for RandomForest
+rf_param_dist = {
+    'n_estimators': randint(50, 200),
+    'max_depth': [10, 20, None],
+    'min_samples_split': randint(2, 10),
+    'min_samples_leaf': randint(1, 5)
+}
+
+rf_model = RandomForestRegressor(random_state=42)
+rf_random_search = RandomizedSearchCV(estimator=rf_model, param_distributions=rf_param_dist, n_iter=20, cv=3, n_jobs=-1, verbose=2, random_state=42)
+rf_random_search.fit(X_train, y_train)
+
+# Best RandomForest model
+best_rf_model = rf_random_search.best_estimator_
+
+# Hyperparameter tuning for XGBoost
+xgb_param_dist = {
+    'n_estimators': randint(50, 200),
+    'max_depth': randint(3, 10),
+    'learning_rate': uniform(0.01, 0.2),
+    'subsample': uniform(0.6, 0.4),
+    'colsample_bytree': uniform(0.6, 0.4),
+    'reg_alpha': uniform(0, 1),
+    'reg_lambda': uniform(0, 1)
+}
+
+xgb_model = xgb.XGBRegressor(objective='reg:squarederror', random_state=42)
+xgb_random_search = RandomizedSearchCV(estimator=xgb_model, param_distributions=xgb_param_dist, n_iter=50, cv=3, n_jobs=-1, verbose=2, random_state=42)
+xgb_random_search.fit(X_train, y_train)
+
+# Best XGBoost model
+best_xgb_model = xgb_random_search.best_estimator_
+
+# Define the stacking ensemble
+estimators = [
+    ('rf', best_rf_model),
+    ('xgb', best_xgb_model)
+]
+
+stacking_model = StackingRegressor(estimators=estimators, final_estimator=LinearRegression())
+stacking_model.fit(X_train, y_train)
+
+# Evaluate the stacking model
+y_pred_stacking = stacking_model.predict(X_test)
+mse_stacking = mean_squared_error(y_test, y_pred_stacking)
+print(f"Mean Squared Error (Stacking Model): {mse_stacking}")
+
+# Prepare the submission key data
+submission_key['date'] = pd.to_datetime(submission_key['date'])
+submission_key['year'] = submission_key['date'].dt.year
+submission_key['month'] = submission_key['date'].dt.month
+submission_key['day'] = submission_key['date'].dt.day
+submission_key['day_of_year'] = submission_key['date'].dt.dayofyear
+submission_key['city_id'] = submission_key['city_id'].str.extract('(\d+)').astype(int)
+
+# Add the avg_wind_speed_kmh feature to submission_key
+submission_key['avg_wind_speed_kmh'] = avg_wind_speed_mean
+
+X_submission = submission_key[['city_id', 'year', 'month', 'day', 'day_of_year', 'avg_wind_speed_kmh']]
+
+# Predict the average temperatures using the stacking model
+submission_predictions_stacking = stacking_model.predict(X_submission)
+
+# Round predictions to one decimal place
+submission_predictions_stacking = np.round(submission_predictions_stacking, 1)
+
+# Prepare the submission file
+submission_stacking = sample_submission.copy()
+submission_stacking['avg_temp_c'] = submission_predictions_stacking
+
+# Save the submission file
+submission_stacking.to_csv('/kaggle/working/submission_out_tune_stacking.csv', index=False)
+
+print("Submission file saved as 'submission_out_tune_stacking.csv'")
